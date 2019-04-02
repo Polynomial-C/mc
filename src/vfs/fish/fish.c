@@ -51,6 +51,7 @@
 /* Define this if your ssh can take -I option */
 
 #include <config.h>
+#include <assert.h>
 #include <errno.h>
 #include <pwd.h>
 #include <grp.h>
@@ -151,8 +152,6 @@ typedef struct
 {
     vfs_file_handler_t base;    /* base class */
 
-    off_t got;
-    off_t total;
     gboolean append;
 } fish_file_handler_t;
 
@@ -966,233 +965,6 @@ fish_dir_load (struct vfs_class *me, struct vfs_s_inode *dir, char *remote_path)
 /* --------------------------------------------------------------------------------------------- */
 
 static int
-fish_file_store (struct vfs_class *me, vfs_file_handler_t * fh, char *name, char *localname)
-{
-    fish_file_handler_t *fish = FISH_FILE_HANDLER (fh);
-    struct vfs_s_super *super = VFS_FILE_HANDLER_SUPER (fh);
-    fish_super_t *fish_super = FISH_SUPER (super);
-    int code;
-    off_t total = 0;
-    char buffer[BUF_8K];
-    struct stat s;
-    int h;
-    char *quoted_name;
-
-    h = open (localname, O_RDONLY);
-    if (h == -1)
-        ERRNOR (EIO, -1);
-    if (fstat (h, &s) < 0)
-    {
-        close (h);
-        ERRNOR (EIO, -1);
-    }
-
-    /* First, try this as stor:
-     *
-     *     ( head -c number ) | ( cat > file; cat >/dev/null )
-     *
-     *  If 'head' is not present on the remote system, 'dd' will be used.
-     * Unfortunately, we cannot trust most non-GNU 'head' implementations
-     * even if '-c' options is supported. Therefore, we separate GNU head
-     * (and other modern heads?) using '-q' and '-' . This causes another
-     * implementations to fail (because of "incorrect options").
-     *
-     *  Fallback is:
-     *
-     *     rest=<number>
-     *     while [ $rest -gt 0 ]
-     *     do
-     *        cnt=`expr \( $rest + 255 \) / 256`
-     *        n=`dd bs=256 count=$cnt | tee -a <target_file> | wc -c`
-     *        rest=`expr $rest - $n`
-     *     done
-     *
-     *  'dd' was not designed for full filling of input buffers,
-     *  and does not report exact number of bytes (not blocks).
-     *  Therefore a more complex shell script is needed.
-     *
-     *   On some systems non-GNU head writes "Usage:" error report to stdout
-     *  instead of stderr. It makes impossible the use of "head || dd"
-     *  algorithm for file appending case, therefore just "dd" is used for it.
-     */
-
-    quoted_name = strutils_shell_escape (name);
-    vfs_print_message (_("fish: store %s: sending command..."), quoted_name);
-
-    /* FIXME: File size is limited to ULONG_MAX */
-    code =
-        fish_command_v (me, super, WAIT_REPLY,
-                        fish->append ? fish_super->scr_append : fish_super->scr_send,
-                        "FISH_FILENAME=%s FISH_FILESIZE=%" PRIuMAX ";\n", quoted_name,
-                        (uintmax_t) s.st_size);
-    g_free (quoted_name);
-
-    if (code != PRELIM)
-    {
-        close (h);
-        ERRNOR (E_REMOTE, -1);
-    }
-
-    while (TRUE)
-    {
-        ssize_t n, t;
-
-        while ((n = read (h, buffer, sizeof (buffer))) < 0)
-        {
-            if ((errno == EINTR) && tty_got_interrupt ())
-                continue;
-            vfs_print_message ("%s", _("fish: Local read failed, sending zeros"));
-            close (h);
-            h = open ("/dev/zero", O_RDONLY);
-        }
-
-        if (n == 0)
-            break;
-
-        t = write (fish_super->sockw, buffer, n);
-        if (t != n)
-        {
-            if (t == -1)
-                me->verrno = errno;
-            else
-                me->verrno = EIO;
-            goto error_return;
-        }
-        tty_disable_interrupt_key ();
-        total += n;
-        vfs_print_message ("%s: %" PRIuMAX "/%" PRIuMAX, _("fish: storing file"),
-                           (uintmax_t) total, (uintmax_t) s.st_size);
-    }
-    close (h);
-
-    if (fish_get_reply (me, fish_super->sockr, NULL, 0) != COMPLETE)
-        ERRNOR (E_REMOTE, -1);
-    return 0;
-
-  error_return:
-    close (h);
-    fish_get_reply (me, fish_super->sockr, NULL, 0);
-    return -1;
-}
-
-/* --------------------------------------------------------------------------------------------- */
-
-static int
-fish_linear_start (struct vfs_class *me, vfs_file_handler_t * fh, off_t offset)
-{
-    fish_file_handler_t *fish = FISH_FILE_HANDLER (fh);
-    struct vfs_s_super *super = VFS_FILE_HANDLER_SUPER (fh);
-    char *name;
-    char *quoted_name;
-
-    name = vfs_s_fullpath (me, fh->ino);
-    if (name == NULL)
-        return 0;
-    quoted_name = strutils_shell_escape (name);
-    g_free (name);
-    fish->append = FALSE;
-
-    /*
-     * Check whether the remote file is readable by using 'dd' to copy 
-     * a single byte from the remote file to /dev/null. If 'dd' completes
-     * with exit status of 0 use 'cat' to send the file contents to the
-     * standard output (i.e. over the network).
-     */
-
-    offset =
-        fish_command_v (me, super, WANT_STRING, FISH_SUPER (super)->scr_get,
-                        "FISH_FILENAME=%s FISH_START_OFFSET=%" PRIuMAX ";\n", quoted_name,
-                        (uintmax_t) offset);
-    g_free (quoted_name);
-
-    if (offset != PRELIM)
-        ERRNOR (E_REMOTE, 0);
-    fh->linear = LS_LINEAR_OPEN;
-    fish->got = 0;
-    errno = 0;
-#if SIZEOF_OFF_T == SIZEOF_LONG
-    fish->total = (off_t) strtol (reply_str, NULL, 10);
-#else
-    fish->total = (off_t) g_ascii_strtoll (reply_str, NULL, 10);
-#endif
-    if (errno != 0)
-        ERRNOR (E_REMOTE, 0);
-    return 1;
-}
-
-/* --------------------------------------------------------------------------------------------- */
-
-static void
-fish_linear_abort (struct vfs_class *me, vfs_file_handler_t * fh)
-{
-    fish_file_handler_t *fish = FISH_FILE_HANDLER (fh);
-    struct vfs_s_super *super = VFS_FILE_HANDLER_SUPER (fh);
-    char buffer[BUF_8K];
-    ssize_t n;
-
-    vfs_print_message ("%s", _("Aborting transfer..."));
-
-    do
-    {
-        n = MIN ((off_t) sizeof (buffer), (fish->total - fish->got));
-        if (n != 0)
-        {
-            n = read (FISH_SUPER (super)->sockr, buffer, n);
-            if (n < 0)
-                return;
-            fish->got += n;
-        }
-    }
-    while (n != 0);
-
-    if (fish_get_reply (me, FISH_SUPER (super)->sockr, NULL, 0) != COMPLETE)
-        vfs_print_message ("%s", _("Error reported after abort."));
-    else
-        vfs_print_message ("%s", _("Aborted transfer would be successful."));
-}
-
-/* --------------------------------------------------------------------------------------------- */
-
-static ssize_t
-fish_linear_read (struct vfs_class *me, vfs_file_handler_t * fh, void *buf, size_t len)
-{
-    fish_file_handler_t *fish = FISH_FILE_HANDLER (fh);
-    struct vfs_s_super *super = VFS_FILE_HANDLER_SUPER (fh);
-    ssize_t n = 0;
-
-    len = MIN ((size_t) (fish->total - fish->got), len);
-    tty_disable_interrupt_key ();
-    while (len != 0 && ((n = read (FISH_SUPER (super)->sockr, buf, len)) < 0))
-    {
-        if ((errno == EINTR) && !tty_got_interrupt ())
-            continue;
-        break;
-    }
-    tty_enable_interrupt_key ();
-
-    if (n > 0)
-        fish->got += n;
-    else if (n < 0)
-        fish_linear_abort (me, fh);
-    else if (fish_get_reply (me, FISH_SUPER (super)->sockr, NULL, 0) != COMPLETE)
-        ERRNOR (E_REMOTE, -1);
-    ERRNOR (errno, n);
-}
-
-/* --------------------------------------------------------------------------------------------- */
-
-static void
-fish_linear_close (struct vfs_class *me, vfs_file_handler_t * fh)
-{
-    fish_file_handler_t *fish = FISH_FILE_HANDLER (fh);
-
-    if (fish->total != fish->got)
-        fish_linear_abort (me, fh);
-}
-
-/* --------------------------------------------------------------------------------------------- */
-
-static int
 fish_ctl (void *fh, int ctlop, void *arg)
 {
     (void) arg;
@@ -1206,13 +978,7 @@ fish_ctl (void *fh, int ctlop, void *arg)
     {
     case VFS_CTL_IS_NOTREADY:
         {
-            vfs_file_handler_t *file = VFS_FILE_HANDLER (fh);
             int v;
-
-            if (file->linear == LS_NOT_LINEAR)
-                vfs_die ("You may not do this");
-            if (file->linear == LS_LINEAR_CLOSED || file->linear == LS_LINEAR_PREOPEN)
-                return 0;
 
             v = vfs_s_select_on_two (VFS_FILE_HANDLER_SUPER (fh)->u.fish.sockr, 0);
 
@@ -1654,40 +1420,35 @@ fish_fh_open (struct vfs_class *me, vfs_file_handler_t * fh, int flags, mode_t m
 {
     fish_file_handler_t *fish = FISH_FILE_HANDLER (fh);
 
+    (void) me;
     (void) mode;
 
     /* File will be written only, so no need to retrieve it */
-    if (((flags & O_WRONLY) == O_WRONLY) && ((flags & (O_RDONLY | O_RDWR)) == 0))
+    if ((flags & O_WRONLY) != 0 && (flags & (O_RDONLY | O_RDWR)) == 0)
     {
+        fh->pos = 0;
+
         /* user pressed the button [ Append ] in the "Copy" dialog */
         if ((flags & O_APPEND) != 0)
-            fish->append = TRUE;
-
-        if (fh->ino->localname == NULL)
         {
-            vfs_path_t *vpath;
-            int tmp_handle;
-
-            tmp_handle = vfs_mkstemps (&vpath, me->name, fh->ino->ent->name);
-            if (tmp_handle == -1)
-            {
-                vfs_path_free (vpath);
-                goto fail;
-            }
-            fh->ino->localname = g_strdup (vfs_path_as_str (vpath));
-            vfs_path_free (vpath);
-            close (tmp_handle);
+            fh->pos = fh->ino->st.st_size;      /* FIXME */
+            fish->append = TRUE;
         }
-        return 0;
     }
-    if (fh->ino->localname == NULL && vfs_s_retrieve_file (me, fh->ino) == -1)
-        goto fail;
-    if (fh->ino->localname == NULL)
-        vfs_die ("retrieve_file failed to fill in localname");
-    return 0;
 
-  fail:
-    return -1;
+    return 0;
+}
+
+/* --------------------------------------------------------------------------------------------- */
+
+static int
+fish_fh_close (struct vfs_class *me, vfs_file_handler_t * fh)
+{
+    (void) me;
+
+    FISH_FILE_HANDLER (fh)->append = FALSE;
+
+    return 0;
 }
 
 /* --------------------------------------------------------------------------------------------- */
@@ -1745,6 +1506,74 @@ fish_open (const vfs_path_t * vpath, int flags, mode_t mode)
 }
 
 /* --------------------------------------------------------------------------------------------- */
+
+static ssize_t
+fish_read (void *fh, char *buffer, size_t len)
+{
+    fish_file_handler_t *file = FISH_FILE_HANDLER (fh);
+    struct vfs_s_super *super = VFS_FILE_HANDLER_SUPER (fh);
+    struct vfs_class *me = super->me;
+
+    /* NOT IMPLEMENTED YET */
+    (void) len;
+    (void) buffer;
+    (void) file;
+    (void) me;
+
+    return (-1);
+}
+
+/* --------------------------------------------------------------------------------------------- */
+
+static ssize_t
+fish_write (void *fh, const char *buf, size_t len)
+{
+    vfs_file_handler_t *file = VFS_FILE_HANDLER (fh);
+    struct vfs_s_super *super = VFS_FILE_HANDLER_SUPER (fh);
+    struct vfs_class *me = super->me;
+
+    fish_file_handler_t *fish_file = FISH_FILE_HANDLER (fh);
+    fish_super_t *fish_super = FISH_SUPER (super);
+
+    char *name, *quoted_name;
+    ssize_t n;
+
+    name = vfs_s_fullpath (me, file->ino);
+    quoted_name = strutils_shell_escape (name);
+    g_free (name);
+
+    /* FIXME: File size is limited to ULONG_MAX */
+    n = fish_command_v (me, super, WAIT_REPLY,
+                        fish_file->append ? fish_super->scr_append : fish_super->scr_send,
+                        "FISH_FILENAME=%s FISH_FILESIZE=%" PRIuMAX ";\n", quoted_name,
+                        (uintmax_t) len);
+    g_free (quoted_name);
+
+    if (n != PRELIM)
+        ERRNOR (E_REMOTE, -1);
+
+    n = write (fish_super->sockw, buf, len);
+    if (n != (ssize_t) len)
+    {
+        if (n == -1)
+            me->verrno = errno;
+        else
+            me->verrno = EIO;
+
+        ERRNOR (me->verrno, -1);
+    }
+
+    /* once wrote to new file, then append */
+    fish_file->append = TRUE;
+    file->pos += n;
+
+    if (fish_get_reply (me, fish_super->sockr, NULL, 0) != COMPLETE)
+        ERRNOR (E_REMOTE, -1);
+
+    ERRNOR (errno, n);
+}
+
+/* --------------------------------------------------------------------------------------------- */
 /*** public functions ****************************************************************************/
 /* --------------------------------------------------------------------------------------------- */
 
@@ -1753,7 +1582,7 @@ init_fish (void)
 {
     tcp_init ();
 
-    vfs_init_subclass (&fish_subclass, "fish", VFS_REMOTE | VFS_USETMP, "sh");
+    vfs_init_subclass (&fish_subclass, "fish", VFS_REMOTE, "sh");
     vfs_fish_ops->fill_names = fish_fill_names;
     vfs_fish_ops->stat = fish_stat;
     vfs_fish_ops->lstat = fish_lstat;
@@ -1762,6 +1591,8 @@ init_fish (void)
     vfs_fish_ops->chown = fish_chown;
     vfs_fish_ops->utime = fish_utime;
     vfs_fish_ops->open = fish_open;
+    vfs_fish_ops->read = fish_read;
+    vfs_fish_ops->write = fish_write;
     vfs_fish_ops->symlink = fish_symlink;
     vfs_fish_ops->link = fish_link;
     vfs_fish_ops->unlink = fish_unlink;
@@ -1775,11 +1606,8 @@ init_fish (void)
     fish_subclass.free_archive = fish_free_archive;
     fish_subclass.fh_new = fish_fh_new;
     fish_subclass.fh_open = fish_fh_open;
+    fish_subclass.fh_close = fish_fh_close;
     fish_subclass.dir_load = fish_dir_load;
-    fish_subclass.file_store = fish_file_store;
-    fish_subclass.linear_start = fish_linear_start;
-    fish_subclass.linear_read = fish_linear_read;
-    fish_subclass.linear_close = fish_linear_close;
     vfs_register_class (vfs_fish_ops);
 }
 
