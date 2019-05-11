@@ -82,7 +82,7 @@ setup (void)
 
     mc_global.sysconfig_dir = (char *) TEST_SHARE_DIR;
 
-    vfs_local_ops.chdir = test_chdir;
+    vfs_local_ops->chdir = test_chdir;
 
     test_chdir__init ();
 }
