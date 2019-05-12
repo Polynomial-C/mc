@@ -55,7 +55,7 @@ setup (void)
     str_init_strings (NULL);
 
     vfs_init ();
-    init_localfs ();
+    vfs_init_localfs ();
     vfs_setup_work_dir ();
 
     vfs_init_class (&vfs_test_ops, "testfs", VFS_UNKNOWN, "test");
