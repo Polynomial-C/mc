@@ -328,6 +328,8 @@ vfs_release_path (const vfs_path_t * vpath)
 void
 vfs_gc_done (void)
 {
+    /* reverse list to free nested vfses at first */
+    stamps = g_slist_reverse (stamps);
     g_slist_foreach (stamps, vfs_stamp_free, NULL);
     g_slist_free_full (stamps, g_free);
     stamps = NULL;
